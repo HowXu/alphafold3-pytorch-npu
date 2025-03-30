@@ -671,7 +671,7 @@ def get_indices_three_closest_atom_pos(
 
     # get distances between all atoms
 
-    atom_dist = torch.cdist(atom_pos, atom_pos)
+    atom_dist = cdist_npu(atom_pos, atom_pos)
 
     # mask out the distance to self
 

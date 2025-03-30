@@ -79,6 +79,8 @@ from alphafold3_pytorch.utils.model_utils import (
 from alphafold3_pytorch.cli import cli
 from alphafold3_pytorch.app import app
 
+from .npu import tensor_to_npu,tensor_to_npu_re,cdist_npu
+
 __all__ = [
     Attention,
     Attend,

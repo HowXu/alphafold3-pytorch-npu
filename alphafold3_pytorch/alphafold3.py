@@ -11,7 +11,8 @@ from collections import namedtuple
 import torch
 from torch import nn
 from torch import Tensor, tensor, is_tensor
-from torch.amp import autocast
+# from torch.amp import autocast
+from torch_npu.npu.amp import autocast
 import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 
@@ -138,6 +139,8 @@ from Bio.PDB.StructureBuilder import StructureBuilder
 import einx
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 from einops.layers.torch import Rearrange
+
+from alphafold3_pytorch.npu import tensor_to_npu,cdist_npu# ,tensor_to_npu_re
 
 """
 global ein notation:
@@ -3072,8 +3075,8 @@ class ElucidatedAtomDiffusion(Module):
 
             atompair_mask = to_pairwise_mask(atom_mask)
 
-            denoised_cdist = torch.cdist(denoised_atom_pos, denoised_atom_pos, p = 2)
-            normalized_cdist = torch.cdist(atom_pos_ground_truth, atom_pos_ground_truth, p = 2)
+            denoised_cdist = cdist_npu(denoised_atom_pos, denoised_atom_pos, p = 2)
+            normalized_cdist = cdist_npu(atom_pos_ground_truth, atom_pos_ground_truth, p = 2)
 
             bond_losses = F.mse_loss(denoised_cdist, normalized_cdist, reduction = 'none')
             bond_losses = bond_losses * loss_weights
@@ -3169,8 +3172,8 @@ class SmoothLDDTLoss(Module):
         """
         # Compute distances between all pairs of atoms
 
-        pred_dists = torch.cdist(pred_coords, pred_coords)
-        true_dists = torch.cdist(true_coords, true_coords)
+        pred_dists = cdist_npu(pred_coords, pred_coords)
+        true_dists = cdist_npu(true_coords, true_coords)
 
         # Compute distance difference for all pairs of atoms
         dist_diff = torch.abs(true_dists - pred_dists)
@@ -3207,7 +3210,8 @@ class WeightedRigidAlign(Module):
     """Algorithm 28."""
 
     @typecheck
-    @autocast("cuda", enabled=False)
+    @autocast(False)
+    # @autocast("cuda", enabled=False)
     def forward(
         self,
         pred_coords: Float["b m 3"],  # type: ignore - predicted coordinates
@@ -3269,7 +3273,14 @@ class WeightedRigidAlign(Module):
         )
 
         # Compute the SVD of the covariance matrix
+        
+        #精度问题 cpu only
+        cov_matrix = cov_matrix.cpu()
         U, S, V = torch.svd(cov_matrix)
+        # 转回 npu
+        U = tensor_to_npu(U)
+        S = tensor_to_npu(S)
+        V = tensor_to_npu(V)
         U_T = U.transpose(-2, -1)
 
         # Catch ambiguous rotation by checking the magnitude of singular values
@@ -3279,8 +3290,12 @@ class WeightedRigidAlign(Module):
                 + "cross-correlation between aligned point clouds. "
                 + "`WeightedRigidAlign` cannot return a unique rotation."
             )
-
-        det = torch.det(einsum(V, U_T, "b i j, b j k -> b i k"))
+        
+        # CPU化进行det函数
+        mid = einsum(V, U_T, "b i j, b j k -> b i k")
+        mid = mid.cpu()
+        det = torch.det(mid)
+        det = tensor_to_npu(det)
 
         # Ensure proper rotation matrix with determinant 1
         diag = torch.eye(dim, dtype=det.dtype, device=det.device)
@@ -3290,6 +3305,9 @@ class WeightedRigidAlign(Module):
         rot_matrix = einsum(V, diag, U_T, "b i j, b j k, b k l -> b i l")
 
         # Apply the rotation and translation
+        # print(rot_matrix.device)
+        # print(true_coords_centered.device)
+        # print(pred_centroid.device)
         true_aligned_coords = (
             einsum(rot_matrix, true_coords_centered, "b i j, b n j -> b n i") + pred_centroid
         )
@@ -4672,8 +4690,8 @@ class ConfidenceHead(Module):
         pred_molecule_pos = pred_atom_pos.gather(1, molecule_atom_indices)
 
         # interatomic distances - embed and add to pairwise
-
-        intermolecule_dist = torch.cdist(pred_molecule_pos, pred_molecule_pos, p=2)
+        # torch.cdist
+        intermolecule_dist = cdist_npu(pred_molecule_pos, pred_molecule_pos, p=2)
 
         dist_bin_indices = distance_to_dgram(
             intermolecule_dist, self.atompair_dist_bins, return_labels=True
@@ -4992,7 +5010,7 @@ class ComputeClash(Module):
                 chain_j_len = mask_j.sum()
                 assert min(chain_i_len, chain_j_len) > 0
 
-                chain_pair_dist = torch.cdist(atom_pos[mask_i], atom_pos[mask_j])
+                chain_pair_dist = cdist_npu(atom_pos[mask_i], atom_pos[mask_j])
                 chain_pair_clash = chain_pair_dist < self.atom_clash_dist
                 clashes = chain_pair_clash.sum()
                 has_clash = (clashes > self.chain_clash_count) or (
@@ -5568,8 +5586,8 @@ class ComputeModelSelectionScore(Module):
         atom_seq_len, device = pred_coords.shape[1], pred_coords.device
 
         # Compute distances between all pairs of atoms
-        pred_dists = torch.cdist(pred_coords, pred_coords)
-        true_dists = torch.cdist(true_coords, true_coords)
+        pred_dists = cdist_npu(pred_coords, pred_coords)
+        true_dists = cdist_npu(true_coords, true_coords)
 
         # Compute distance difference for all pairs of atoms
         dist_diff = torch.abs(true_dists - pred_dists)
@@ -7281,7 +7299,7 @@ class Alphafold3(Module):
             else:
                 distogram_mask = atom_mask
 
-            distogram_dist = torch.cdist(distogram_pos, distogram_pos, p=2)
+            distogram_dist = cdist_npu(distogram_pos, distogram_pos, p=2)
             distance_labels = distance_to_dgram(
                 distogram_dist, self.distance_bins, return_labels = True
             )
@@ -7631,8 +7649,8 @@ class Alphafold3(Module):
 
                 molecule_mask = valid_molecule_atom_mask
 
-                pde_gt_dist = torch.cdist(molecule_pos, molecule_pos, p=2)
-                pde_pred_dist = torch.cdist(
+                pde_gt_dist = cdist_npu(molecule_pos, molecule_pos, p=2)
+                pde_pred_dist = cdist_npu(
                     denoised_molecule_pos,
                     denoised_molecule_pos,
                     p=2,
@@ -7660,8 +7678,8 @@ class Alphafold3(Module):
 
                 # compute distances between all pairs of atoms
 
-                pred_dists = torch.cdist(pred_coords, pred_coords, p=2)
-                true_dists = torch.cdist(true_coords, true_coords, p=2)
+                pred_dists = cdist_npu(pred_coords, pred_coords, p=2)
+                true_dists = cdist_npu(true_coords, true_coords, p=2)
 
                 # restrict to bespoke interaction types and inclusion radius on the atom level (Section 4.3.1)
 

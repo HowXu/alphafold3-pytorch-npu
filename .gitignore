@@ -173,3 +173,6 @@ cython_debug/
 .err
 .log
 .sif
+
+test-folder/
+single_test/

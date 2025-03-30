@@ -516,7 +516,7 @@ def _extract_template_features(
         1,
         template_distogram_atom_indices[..., None, None].expand(-1, -1, 3),
     ).squeeze(1)
-    template_distogram_dist = torch.cdist(
+    template_distogram_dist = cdist_npu(
         template_distogram_atom_positions, template_distogram_atom_positions, p=2
     )
     template_distogram = distance_to_dgram(template_distogram_dist, distance_bins)

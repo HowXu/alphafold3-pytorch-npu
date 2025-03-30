@@ -4181,7 +4181,7 @@ def get_token_constraints(
             (num_tokens, num_tokens, constraint_dim), CONSTRAINTS_MASK_VALUE, dtype=torch.float32
         )
 
-        token_dists = torch.cdist(token_pos, token_pos)
+        token_dists = cdist_npu(token_pos, token_pos)
         keep_constraints = inference or (training and random.random() < constraints_ratio)  # nosec
 
         if keep_constraints and constraint == "pocket" and num_chains > 1:
