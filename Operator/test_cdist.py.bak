@@ -1,0 +1,313 @@
+import torch
+import torch_npu  # 添加华为NPU支持
+import time
+import numpy as np
+from operator_deliver.cdist.cdist_impl import custom_cdist
+
+def test_cdist_accuracy(device_cpu='cpu', device_npu='npu', p=2.0, rtol=1e-5, atol=1e-5):
+    """
+    测试自定义cdist算子的准确度
+    
+    参数:
+        device_cpu: CPU设备
+        device_npu: NPU设备
+        p: p范数的p值
+        rtol: 相对误差容忍度
+        atol: 绝对误差容忍度
+    
+    返回:
+        bool: 测试是否通过
+    """
+    print(f"\n测试cdist算子准确度 (p={p}):")
+    
+    # 测试不同规模的输入
+    test_shapes = [
+        # [batch_size, p1, p2, m]
+        [1, 32, 32, 64],      # 小规模测试
+        [2, 64, 128, 256],    # 中等规模测试
+        [4, 128, 64, 512],    # 不对称维度测试
+        [8, 256, 256, 128],   # 大规模测试
+        [1, 25, 26, 64],      # 测试compute_mode边界条件
+        [2, 1, 1, 10],        # 测试最小维度
+    ]
+    
+    # 测试特殊值
+    special_cases = [
+        # 测试接近0的值
+        (torch.rand(2, 3, 4) * 1e-6, torch.rand(2, 5, 4) * 1e-6),
+        # 测试大值
+        (torch.rand(2, 3, 4) * 1e6, torch.rand(2, 5, 4) * 1e6),
+        # 测试正负值混合
+        (torch.randn(2, 3, 4), torch.randn(2, 5, 4)),
+        # 测试全0值
+        (torch.zeros(2, 3, 4), torch.zeros(2, 5, 4)),
+        # 测试全1值
+        (torch.ones(2, 3, 4), torch.ones(2, 5, 4))
+    ]
+    
+    all_passed = True
+    
+    # 测试不同规模
+    for shape in test_shapes:
+        batch_size, p1, p2, m = shape
+        print(f"\n形状: batch_size={batch_size}, p1={p1}, p2={p2}, m={m}")
+        
+        # 生成随机输入数据
+        x1 = torch.randn(batch_size, p1, m)
+        x2 = torch.randn(batch_size, p2, m)
+        
+        # 测试不同compute_mode
+        compute_modes = [
+            'use_mm_for_euclid_dist_if_necessary',
+            'use_mm_for_euclid_dist',
+            'donot_use_mm_for_euclid_dist'
+        ]
+        
+        for mode in compute_modes:
+            if p == 2.0:  # 只在欧氏距离时测试不同compute_mode
+                print(f"\ncompute_mode: {mode}")
+                all_passed &= run_accuracy_test(x1, x2, p, mode, device_cpu, device_npu, rtol, atol)
+            else:
+                all_passed &= run_accuracy_test(x1, x2, p, 'use_mm_for_euclid_dist_if_necessary', 
+                                              device_cpu, device_npu, rtol, atol)
+                break
+    
+    # 测试特殊情况
+    print("\n测试特殊情况:")
+    for i, (x1, x2) in enumerate(special_cases):
+        print(f"\n特殊情况 {i+1}:")
+        all_passed &= run_accuracy_test(x1, x2, p, 'use_mm_for_euclid_dist_if_necessary', 
+                                      device_cpu, device_npu, rtol, atol)
+    
+    return all_passed
+
+def run_accuracy_test(x1, x2, p, compute_mode, device_cpu, device_npu, rtol, atol):
+    """运行单个准确度测试"""
+    # CPU上使用原生cdist
+    x1_cpu = x1.to(device_cpu)
+    x2_cpu = x2.to(device_cpu)
+    start_time = time.time()
+    result_cpu = torch.cdist(x1_cpu, x2_cpu, p=p, compute_mode=compute_mode)
+    cpu_time = time.time() - start_time
+    
+    # NPU上使用自定义cdist
+    try:
+        x1_npu = x1.to(device_npu)
+        x2_npu = x2.to(device_npu)
+        start_time = time.time()
+        result_npu = custom_cdist(x1_npu, x2_npu, p=p, compute_mode=compute_mode)
+        npu_time = time.time() - start_time
+        
+        # 将结果移回CPU进行比较
+        result_npu_cpu = result_npu.to(device_cpu)
+        
+        # 计算误差
+        max_abs_diff = torch.max(torch.abs(result_cpu - result_npu_cpu)).item()
+        max_rel_diff = torch.max(torch.abs((result_cpu - result_npu_cpu) / 
+                                         (torch.abs(result_cpu) + 1e-7))).item()
+        
+        # 检查是否在误差范围内
+        is_close = torch.allclose(result_cpu, result_npu_cpu, rtol=rtol, atol=atol)
+        
+        if is_close:
+            status = "通过"
+        else:
+            status = "失败"
+        
+        print(f"准确度测试 {status}:")
+        print(f"  最大绝对误差: {max_abs_diff:.6e}")
+        print(f"  最大相对误差: {max_rel_diff:.6e}")
+        print(f"  CPU时间: {cpu_time:.6f}秒")
+        print(f"  NPU时间: {npu_time:.6f}秒")
+        print(f"  加速比: {cpu_time/npu_time:.2f}x")
+        
+        return is_close
+        
+    except Exception as e:
+        print(f"NPU测试失败: {e}")
+        return False
+
+def test_cdist_performance(device_cpu='cpu', device_npu='npu', p=2.0, num_runs=10):
+    """
+    测试自定义cdist算子的性能
+    
+    参数:
+        device_cpu: CPU设备
+        device_npu: NPU设备
+        p: p范数的p值
+        num_runs: 每个测试运行的次数
+    """
+    print(f"\n测试cdist算子性能 (p={p}, 运行{num_runs}次):")
+    
+    # 测试不同规模的输入
+    test_shapes = [
+        # [batch_size, p1, p2, m]
+        [1, 32, 32, 64],
+        [2, 64, 128, 256],
+        [4, 128, 64, 512],
+        [8, 256, 256, 128],
+        [16, 512, 512, 256],  # 大规模测试
+        [32, 1024, 1024, 128] # 超大规模测试
+    ]
+    
+    # 测试不同compute_mode（仅在p=2时）
+    compute_modes = ['use_mm_for_euclid_dist_if_necessary']
+    if p == 2.0:
+        compute_modes.extend(['use_mm_for_euclid_dist', 'donot_use_mm_for_euclid_dist'])
+    
+    for shape in test_shapes:
+        batch_size, p1, p2, m = shape
+        print(f"\n形状: batch_size={batch_size}, p1={p1}, p2={p2}, m={m}")
+        
+        # 生成随机输入数据
+        x1 = torch.randn(batch_size, p1, m)
+        x2 = torch.randn(batch_size, p2, m)
+        
+        for mode in compute_modes:
+            print(f"\ncompute_mode: {mode}")
+            
+            # CPU测试
+            x1_cpu = x1.to(device_cpu)
+            x2_cpu = x2.to(device_cpu)
+            
+            # 预热
+            _ = torch.cdist(x1_cpu, x2_cpu, p=p, compute_mode=mode)
+            
+            # 计时
+            cpu_times = []
+            for _ in range(num_runs):
+                torch.cuda.synchronize() if device_cpu == 'cuda' else None
+                start_time = time.time()
+                _ = torch.cdist(x1_cpu, x2_cpu, p=p, compute_mode=mode)
+                torch.cuda.synchronize() if device_cpu == 'cuda' else None
+                cpu_times.append(time.time() - start_time)
+            
+            # NPU测试
+            try:
+                x1_npu = x1.to(device_npu)
+                x2_npu = x2.to(device_npu)
+                
+                # 预热
+                _ = custom_cdist(x1_npu, x2_npu, p=p, compute_mode=mode)
+                
+                # 计时
+                npu_times = []
+                for _ in range(num_runs):
+                    torch.npu.synchronize()
+                    start_time = time.time()
+                    _ = custom_cdist(x1_npu, x2_npu, p=p, compute_mode=mode)
+                    torch.npu.synchronize()
+                    npu_times.append(time.time() - start_time)
+                
+                # 计算统计数据
+                cpu_mean = np.mean(cpu_times)
+                cpu_std = np.std(cpu_times)
+                npu_mean = np.mean(npu_times)
+                npu_std = np.std(npu_times)
+                
+                print(f"CPU时间: {cpu_mean:.6f} ± {cpu_std:.6f}秒")
+                print(f"NPU时间: {npu_mean:.6f} ± {npu_std:.6f}秒")
+                print(f"加速比: {cpu_mean/npu_mean:.2f}x")
+                
+            except Exception as e:
+                print(f"NPU测试失败: {e}")
+
+def test_different_p_values(device_cpu='cpu', device_npu='npu'):
+    """测试不同p值的cdist算子"""
+    # 根据PyTorch文档测试不同的p值
+    p_values = [
+        0,              # 汉明距离
+        1,              # 曼哈顿距离
+        2,              # 欧氏距离
+        2.5,            # 分数p范数
+        float('inf'),   # 无穷范数
+    ]
+    
+    for p in p_values:
+        test_cdist_accuracy(device_cpu, device_npu, p)
+
+def test_scipy_equivalence():
+    """测试与scipy.spatial.distance.cdist的等价性"""
+    try:
+        from scipy.spatial.distance import cdist
+        import numpy as np
+        
+        print("\n测试与scipy.spatial.distance.cdist的等价性:")
+        
+        # 生成测试数据，确保使用float32类型
+        x1 = torch.randn(3, 4, dtype=torch.float32)
+        x2 = torch.randn(5, 4, dtype=torch.float32)
+        
+        # 测试不同的p值
+        for p in [1, 2, float('inf')]:
+            print(f"\np = {p}")
+            
+            # PyTorch结果
+            torch_result = torch.cdist(x1, x2, p=p).to(torch.float32)
+            
+            # 将数据转换为numpy时确保使用float32
+            x1_np = x1.numpy().astype(np.float32)
+            x2_np = x2.numpy().astype(np.float32)
+            
+            # Scipy结果
+            if p == float('inf'):
+                scipy_result = cdist(x1_np, x2_np, lambda u, v: np.abs(u - v).max()).astype(np.float32)
+            elif p == 0:
+                scipy_result = (cdist(x1_np, x2_np, 'hamming') * x1.shape[1]).astype(np.float32)
+            else:
+                scipy_result = cdist(x1_np, x2_np, 'minkowski', p=p).astype(np.float32)
+            
+            # 将scipy结果转换为torch tensor，确保使用float32
+            scipy_result = torch.from_numpy(scipy_result)
+            
+            # 比较结果前确保数据类型一致
+            torch_result = torch_result.to(torch.float32)
+            scipy_result = scipy_result.to(torch.float32)
+            
+            # 比较结果
+            try:
+                is_close = torch.allclose(torch_result, scipy_result, rtol=1e-5, atol=1e-5)
+                print(f"与scipy结果一致: {'是' if is_close else '否'}")
+                if not is_close:
+                    diff = torch.abs(torch_result - scipy_result)
+                    print(f"最大误差: {torch.max(diff).item():.6e}")
+                    print(f"平均误差: {torch.mean(diff).item():.6e}")
+                    print(f"PyTorch结果类型: {torch_result.dtype}")
+                    print(f"Scipy结果类型: {scipy_result.dtype}")
+            except Exception as e:
+                print(f"比较结果时出错: {str(e)}")
+                print(f"PyTorch结果类型: {torch_result.dtype}")
+                print(f"Scipy结果类型: {scipy_result.dtype}")
+                print(f"PyTorch结果形状: {torch_result.shape}")
+                print(f"Scipy结果形状: {scipy_result.shape}")
+    
+    except ImportError:
+        print("未安装scipy，跳过scipy等价性测试")
+    except Exception as e:
+        print(f"测试失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 设置设备
+    device_cpu = 'cpu'
+    device_npu = 'npu:0'  # 假设使用第一个NPU设备
+    
+    print("=" * 50)
+    print("cdist算子测试")
+    print("=" * 50)
+    
+    # 测试准确度
+    print("\n测试不同p值的准确度:")
+    test_different_p_values(device_cpu, device_npu)
+    
+    # 测试性能
+    print("\n测试欧氏距离(p=2)的性能:")
+    test_cdist_performance(device_cpu, device_npu, p=2.0, num_runs=10)
+    
+    # 测试其他常用p值的性能
+    print("\n测试曼哈顿距离(p=1)的性能:")
+    test_cdist_performance(device_cpu, device_npu, p=1.0, num_runs=5)
+    
+    # 测试与scipy的等价性
+    test_scipy_equivalence()

@@ -1,0 +1,61 @@
+import torch
+
+def custom_cdist(x1, x2, p=2.0, compute_mode='use_mm_for_euclid_dist_if_necessary'):
+    """
+    自定义实现的cdist算子，使用基础算子组合实现
+    
+    参数:
+        x1 (Tensor): 形状为 B×P×M 的输入张量
+        x2 (Tensor): 形状为 B×R×M 的输入张量
+        p (float): p范数的p值，默认为2.0（欧氏距离）
+        compute_mode (str): 计算模式，与原始cdist保持一致
+    
+    返回:
+        Tensor: 形状为 B×P×R 的距离矩阵
+    """
+    batch_size = x1.shape[0]
+    p1, m = x1.shape[1], x1.shape[2]
+    p2 = x2.shape[1]
+    
+    if p == 2.0:
+        # 欧氏距离的特殊处理
+        # 使用 ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y> 公式
+        
+        # 计算 ||x||^2
+        x1_norm = torch.sum(x1 * x1, dim=2, keepdim=True)  # B×P×1
+        
+        # 计算 ||y||^2
+        x2_norm = torch.sum(x2 * x2, dim=2, keepdim=True)  # B×R×1
+        x2_norm = x2_norm.transpose(1, 2)  # B×1×R
+        
+        # 计算 -2<x,y>
+        x1_reshaped = x1.reshape(batch_size, p1, 1, m)
+        x2_reshaped = x2.reshape(batch_size, 1, p2, m)
+        dot_product = torch.sum(x1_reshaped * x2_reshaped, dim=3)  # B×P×R
+        
+        # 组合得到距离的平方
+        result_squared = x1_norm + x2_norm - 2 * dot_product
+        
+        # 确保数值稳定性（避免负值）
+        result_squared = torch.clamp(result_squared, min=0.0)
+        
+        # 开平方得到欧氏距离
+        result = torch.sqrt(result_squared)
+        
+    else:
+        # 对于其他p值的实现
+        x1_reshaped = x1.reshape(batch_size, p1, 1, m)
+        x2_reshaped = x2.reshape(batch_size, 1, p2, m)
+        
+        # 计算差的绝对值的p次方
+        if p == 0:
+            # 汉明距离
+            result = torch.sum(torch.ne(x1_reshaped, x2_reshaped).float(), dim=3)
+        elif p == float('inf'):
+            # 无穷范数
+            result = torch.max(torch.abs(x1_reshaped - x2_reshaped), dim=3)[0]
+        else:
+            # 一般p范数
+            result = torch.sum(torch.abs(x1_reshaped - x2_reshaped) ** p, dim=3) ** (1/p)
+    
+    return result
